@@ -51,17 +51,22 @@ class Slices:
     def place(self):
         """
         Return t_r placed (replicated) on all devices, or on their pinned host memory.
-        Called once per parameter group, so that the gradients of the groups are summed where t_r was calculated.
+        Called once per parameter group. t_r is placed only once (at the first call) and shared by the groups,
+        so that the memory does not depend on the number of groups.
+        In pinned mode, the gradient of each group is moved to CPU, where the gradients of the groups are summed.
         """
+        if getattr(self, "_placed", None) is None:
+            t_r = self._t_r if self.mode != "pinned" else jax.lax.stop_gradient(self._t_r)
+            self._placed = jax.device_put(t_r, self._sharding)
         if self.mode != "pinned":
-            return jax.device_put(self._t_r, self._sharding)
-        cpu, sharding = jax.devices("cpu")[0], self._sharding
+            return self._placed
+        cpu = jax.sharding.SingleDeviceSharding(jax.devices("cpu")[0])
 
         @jax.custom_vjp
-        def to_pinned(x):
-            return jax.device_put(x, sharding)
-        to_pinned.defvjp(lambda x: (to_pinned(x), None), lambda _, g: (jax.device_put(g, jax.sharding.SingleDeviceSharding(cpu)),))  # Device object keeps <host> type
-        return to_pinned(self._t_r)
+        def attach(x, placed):
+            return placed
+        attach.defvjp(lambda x, placed: (placed, None), lambda _, g: (jax.device_put(g, cpu), None))  # Device object keeps <host> type
+        return attach(self._t_r, self._placed)
 
 
 def multislice(pot, tem, probe="TEM", postprocess=None, sum=False, data=None, use_checkpoint=False, mesh=None, slices="auto", chunk="auto", batch="auto", group="auto"):
@@ -115,7 +120,7 @@ def multislice(pot, tem, probe="TEM", postprocess=None, sum=False, data=None, us
 
     spd = sp.asdict()
     def calc_group(p):
-        return calc(p, t_r.place(), spd, probes)     # place() for each group, so that the gradient of t_r is summed on CPU
+        return calc(p, t_r.place(), spd, probes)     # place() for each group, so that the gradient of t_r is summed on CPU in pinned mode
     phi = _map_groups(calc_group, params, ndev, group, sum)
     if not sum:
         phi = phi[:nparams]
@@ -180,13 +185,16 @@ def _map_groups(f, params, ndev, group, sum):
     n_local = len(jax.tree.leaves(params)[0]) // ndev
     local = jax.tree.map(lambda v: v.reshape(ndev, n_local, *v.shape[1:]), params)
     cpu = jax.sharding.SingleDeviceSharding(jax.devices("cpu")[0])
-    res = []
+    res = None if sum else []
     for start in range(0, n_local, group):
         p = jax.tree.map(lambda v: v[:, start:start + group].reshape(-1, *v.shape[2:]), local)
         r = f(p)
-        res.append(r if sum else jax.device_put(r, cpu).reshape(ndev, group, *r.shape[1:]))   # only one group stays on device
+        if sum:
+            res = r if res is None else res + r     # summed one by one, so that only one group result stays on device
+        else:
+            res.append(jax.device_put(r, cpu).reshape(ndev, group, *r.shape[1:]))   # only one group stays on device
     if sum:
-        return functools.reduce(jnp.add, res)
+        return res
     return jnp.concatenate(res, axis=1).reshape(ndev * n_local, *res[0].shape[2:])
 
 
