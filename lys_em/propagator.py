@@ -107,3 +107,28 @@ def make_propagator(chunk=None, batch=1, nslices=None):
             return prop(phi0, Pk, t_r)
         return _forward(phi0, Pk, t_r, size(t_r), batch, nslices)[0]
     return propagate
+
+
+def make_sharded_propagator(nz, mesh, batch=1):
+    """
+    Return prop(phi0, Pk, t) -> phi for slices distributed over the devices (Slices mode "sharded"), used inside shard_map.
+    t: (m, Nx, Ny) on each device, where device d has the slices d, d + ndev, ... of the nz slices.
+    Slice k is sent from its device to all devices (psum) when it is used, and in the backward pass its gradient is summed
+    (psum) and kept only on that device, so that no device has all the slices or their gradients.
+    """
+    axis, ndev = mesh.axis_names[0], mesh.size
+
+    def propagate_one(phi, t, Pk):
+        def fetch(k):
+            mine = jax.lax.axis_index(axis) == k % ndev
+            return _pvary(jax.lax.psum(jnp.where(mine, t[k // ndev], 0), axis), (axis,))   # device-varying like phi
+
+        def segment(phi, offset, size):
+            return jax.lax.fori_loop(0, size, lambda i, phi: jnp.fft.ifft2(jnp.fft.fft2(phi * fetch(offset + i)) * Pk), phi)
+        size = max(s for s in range(1, math.isqrt(nz) + 1) if nz % s == 0)    # checkpointed segments of about sqrt(nz) slices
+        return jax.lax.fori_loop(0, nz // size, lambda j, phi: jax.checkpoint(segment, static_argnums=2)(phi, j * size, size), phi)
+
+    def prop(phi0, Pk, t):
+        f = jax.checkpoint(lambda a: propagate_one(a[0], t, a[1]))
+        return jax.lax.map(f, (phi0, Pk), batch_size=batch)
+    return prop

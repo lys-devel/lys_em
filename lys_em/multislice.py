@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
-from .propagator import make_propagator
+from .propagator import make_propagator, make_sharded_propagator
 
 shard_map = jax.shard_map if hasattr(jax, 'shard_map') else jax.experimental.shard_map.shard_map
 
@@ -16,10 +16,13 @@ class Slices:
     Args:
         pot, tem: The potential and the TEM object.
         mesh (jax.sharding.Mesh): The 1D mesh of the devices. All devices if None.
-        mode (str): "device", "pinned" or "auto".
+        mode (str): "device", "pinned", "sharded" or "auto".
             "device": All slices are placed (replicated) on each device. Device memory ~ Nz.
             "pinned": Slices are placed in pinned host memory and copied to device chunk by chunk.
                 Device memory does not depend on Nz.
+            "sharded": The slices are distributed over the devices (slice k on device k % ndev), and each slice is
+                sent to all devices when it is used. The gradient of each slice is summed on its device.
+                Memory of all devices ~ Nz, not ndev * Nz (useful for many CPU devices). chunk is not used.
             "auto": "pinned" if chunk is given and running on GPU, otherwise "device".
         chunk (int): Number of slices copied to device at once.
             If Nz is not a multiple of chunk, the slices are padded at the end (see nslices).
@@ -40,12 +43,16 @@ class Slices:
             self._t_r = pot.getTransmissionFunction(tem)
         self.nslices = None
         nz = len(self._t_r)
+        mesh = jax.sharding.Mesh(jax.devices(), ('i',)) if mesh is None else mesh
+        if mode == "sharded":
+            self.mode, self.nz, self._ndev = mode, nz, mesh.size
+            self._sharding = jax.sharding.NamedSharding(mesh, P(mesh.axis_names[0]))
+            return
         if chunk is not None and chunk < nz and nz % chunk:
             self.nslices = nz
             with jax.default_device(jax.devices("cpu")[0] if mode == "pinned" else None):
                 self._t_r = jnp.pad(self._t_r, ((0, chunk - nz % chunk), (0, 0), (0, 0)), constant_values=1)
         self.mode = mode
-        mesh = jax.sharding.Mesh(jax.devices(), ('i',)) if mesh is None else mesh
         self._sharding = jax.sharding.NamedSharding(mesh, P(), memory_kind="pinned_host" if mode == "pinned" else "device")
 
     def place(self):
@@ -57,6 +64,11 @@ class Slices:
         """
         if getattr(self, "_placed", None) is None:
             t_r = self._t_r if self.mode != "pinned" else jax.lax.stop_gradient(self._t_r)
+            if self.mode == "sharded":
+                # Device d has the slices d, d + ndev, d + 2 * ndev, ... (padded with dummy slices).
+                n, m = self._ndev, -(-self.nz // self._ndev)
+                t_r = jnp.concatenate([t_r, jnp.ones((n * m - self.nz, *t_r.shape[1:]), t_r.dtype)])
+                t_r = t_r.reshape(m, n, *t_r.shape[1:]).swapaxes(0, 1).reshape(n * m, *t_r.shape[1:])
             self._placed = jax.device_put(t_r, self._sharding)
         if self.mode != "pinned":
             return self._placed
@@ -105,7 +117,7 @@ def multislice(pot, tem, probe="TEM", postprocess=None, sum=False, data=None, us
     t_r = Slices(pot, tem, slices, chunk, mesh)
     probe_type = probe if isinstance(probe, str) else None
     probes = probe if probe_type is None else jnp.array([jnp.fft.ifft2(jnp.ones(sp.N[:2]))])
-    calc = _build_calc(probe_type, postprocess, sum, data is not None, chunk, batch, t_r.nslices, mesh)
+    calc = _build_calc(probe_type, postprocess, sum, data is not None, chunk, batch, t_r.nslices, mesh, t_r.nz if t_r.mode == "sharded" else None)
 
     # Pad the parameters so that each device has the same number of groups of the same size.
     nparams = len(tem.params)
@@ -144,12 +156,13 @@ def _auto_options(sp, chunk, batch, group):
 
 
 @functools.lru_cache
-def _build_calc(probe_type, postprocess, sum, use_data, chunk, batch, nslices, mesh):
+def _build_calc(probe_type, postprocess, sum, use_data, chunk, batch, nslices, mesh, sharded=None):
     """
     Return the jitted function calc(params, t_r, spd, probes) for a group of parameters.
     It is cached so that it is compiled only once for the same options and shapes.
     """
-    prop = make_propagator(chunk=chunk, batch=batch, nslices=nslices)
+    # sharded: number of slices if they are distributed over the devices (Slices mode "sharded")
+    prop = make_propagator(chunk=chunk, batch=batch, nslices=nslices) if sharded is None else make_sharded_propagator(sharded, mesh, batch)
     post = _init_postprocess(postprocess)
     post_with_data = use_data and len(inspect.signature(post).parameters) == 2
     axis = mesh.axis_names[0]
@@ -172,7 +185,8 @@ def _build_calc(probe_type, postprocess, sum, use_data, chunk, batch, nslices, m
 
     # Parallelization: parameters are distributed to the devices.
     out_specs = P() if sum else P(axis)
-    return jax.jit(jax.checkpoint(shard_map(local_dev, mesh=mesh, in_specs=(P(axis), P(), P(), P()), out_specs=out_specs)))
+    t_spec = P() if sharded is None else P(axis)
+    return jax.jit(jax.checkpoint(shard_map(local_dev, mesh=mesh, in_specs=(P(axis), t_spec, P(), P()), out_specs=out_specs)))
 
 
 def _map_groups(f, params, ndev, group, sum):
