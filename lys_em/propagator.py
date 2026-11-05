@@ -13,6 +13,28 @@ def _pvary(x, axes):
     return jax.lax.pvary(x, axes)
 
 
+@jax.custom_vjp
+def _step(phi, t, Pk):
+    """One slice: ifft2(fft2(phi * t) * Pk). phi: (nprobe, Nx, Ny), t and Pk: (Nx, Ny)."""
+    return jnp.fft.ifft2(jnp.fft.fft2(phi * t) * Pk)
+
+
+def _step_fwd(phi, t, Pk):
+    return _step(phi, t, Pk), (phi, t, Pk)   # only the inputs are kept, not the FFT intermediates
+
+
+def _step_bwd(res, g):
+    # Transpose of the linear map (fft2 and ifft2 are symmetric): u = ifft2(g), v = fft2(u * Pk).
+    phi, t, Pk = res
+    u = jnp.fft.ifft2(g)
+    v = jnp.fft.fft2(u * Pk)
+    dPk = jnp.sum(u * jnp.fft.fft2(phi * t), axis=0)     # fft2(phi * t) is recomputed
+    return v * t, jnp.sum(v * phi, axis=0), dPk
+
+
+_step.defvjp(_step_fwd, _step_bwd)
+
+
 def _propagate(phi, t, Pk, nvalid=None):
     """
     Propagate phi of one parameter (nprobe, Nx, Ny) through the slices t (nslices, Nx, Ny). Pk: (Nx, Ny)
@@ -21,7 +43,8 @@ def _propagate(phi, t, Pk, nvalid=None):
     the backward pass keeps about 2*sqrt(nslices) wave functions instead of nslices.
     """
     def step(i, phi, t, offset):
-        new = jnp.fft.ifft2(jnp.fft.fft2(phi * t[i]) * Pk)
+        vary = lambda x: _pvary(x, tuple(jax.typeof(phi).vma - jax.typeof(x).vma))   # same device-variance as phi for custom_vjp
+        new = _step(phi, vary(t[i]), vary(Pk))
         return new if nvalid is None else jnp.where(offset + i < nvalid, new, phi)
 
     def segment(phi, t, offset):
