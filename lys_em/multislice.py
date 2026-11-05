@@ -149,7 +149,7 @@ def _build_calc(probe_type, postprocess, sum, use_data, chunk, batch, nslices, m
     Return the jitted function calc(params, t_r, spd, probes) for a group of parameters.
     It is cached so that it is compiled only once for the same options and shapes.
     """
-    prop = make_propagator(chunk=chunk, batch=batch, nslices=nslices)
+    prop = make_propagator(chunk=chunk, batch=batch, nslices=nslices, pk_fn=getPropagationTerm)   # Pk is calculated when it is used
     post = _init_postprocess(postprocess)
     post_with_data = use_data and len(inspect.signature(post).parameters) == 2
     axis = mesh.axis_names[0]
@@ -158,8 +158,7 @@ def _build_calc(probe_type, postprocess, sum, use_data, chunk, batch, nslices, m
         x = dict(x)
         mask, data = x.pop("mask"), x.pop("data", None)
         phi0 = jax.vmap(lambda p: getWaveFunction(spd, p, probes))(x)     # (nparams, modes, Nx, Ny)
-        Pk = jax.vmap(lambda p: getPropagationTerm(spd, p))(x)            # (nparams, Nx, Ny)
-        phi = prop(phi0, Pk, t_r)
+        phi = prop(phi0, x, t_r, spd)     # Pk = getPropagationTerm(spd, x[i]) is calculated in prop
         if probe_type == "TEM":
             aberration = lambda phi, p: jnp.fft.ifft2(jnp.fft.fft2(phi) * getAberrationFunction(spd, p) * spd["mask"])
             phi = jax.vmap(aberration)(phi, x)
