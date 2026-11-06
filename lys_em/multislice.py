@@ -5,6 +5,7 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
 from .propagator import make_propagator, make_sharded_propagator
+from .space import FunctionSpace
 
 shard_map = jax.shard_map if hasattr(jax, 'shard_map') else jax.experimental.shard_map.shard_map
 
@@ -117,7 +118,7 @@ def multislice(pot, tem, probe="TEM", postprocess=None, sum=False, data=None, us
     t_r = Slices(pot, tem, slices, chunk, mesh)
     probe_type = probe if isinstance(probe, str) else None
     probes = probe if probe_type is None else jnp.array([jnp.fft.ifft2(jnp.ones(sp.N[:2]))])
-    calc = _build_calc(probe_type, postprocess, sum, data is not None, chunk, batch, t_r.nslices, mesh, t_r.nz if t_r.mode == "sharded" else None)
+    calc = _build_calc(probe_type, postprocess, sum, data is not None, chunk, batch, t_r.nslices, mesh, tuple(sp.N[:2]), t_r.nz if t_r.mode == "sharded" else None)
 
     # Pad the parameters so that each device has the same number of groups of the same size.
     nparams = len(tem.params)
@@ -130,7 +131,7 @@ def multislice(pot, tem, probe="TEM", postprocess=None, sum=False, data=None, us
     params = jax.tree.map(lambda v: jnp.concatenate([v, jnp.repeat(v[:1], total - nparams, axis=0)]), params)
     params["mask"] = jnp.arange(total) < nparams    # False for padding
 
-    spd = sp.asdict()
+    spd = sp.asdict_compact()     # kvec, mask and k are calculated inside calc where they are used
     def calc_group(p):
         return calc(p, t_r.place(), spd, probes)     # place() for each group, so that the gradient of t_r is summed on CPU in pinned mode
     phi = _map_groups(calc_group, params, ndev, group, sum)
@@ -156,7 +157,7 @@ def _auto_options(sp, chunk, batch, group):
 
 
 @functools.lru_cache
-def _build_calc(probe_type, postprocess, sum, use_data, chunk, batch, nslices, mesh, sharded=None):
+def _build_calc(probe_type, postprocess, sum, use_data, chunk, batch, nslices, mesh, N, sharded=None):
     """
     Return the jitted function calc(params, t_r, spd, probes) for a group of parameters.
     It is cached so that it is compiled only once for the same options and shapes.
@@ -167,14 +168,17 @@ def _build_calc(probe_type, postprocess, sum, use_data, chunk, batch, nslices, m
     post_with_data = use_data and len(inspect.signature(post).parameters) == 2
     axis = mesh.axis_names[0]
 
-    def local_dev(x, t_r, spd, probes):
+    def local_dev(x, t_r, spc, probes):
         x = dict(x)
         mask, data = x.pop("mask"), x.pop("data", None)
-        phi0 = jax.vmap(lambda p: getWaveFunction(spd, p, probes))(x)     # (nparams, modes, Nx, Ny)
-        Pk = jax.vmap(lambda p: getPropagationTerm(spd, p))(x)            # (nparams, Nx, Ny)
+        spd = lambda: FunctionSpace.expand_compact(spc, N)     # kvec, mask and k, calculated where they are used
+        phi0 = jax.vmap(lambda p: getWaveFunction(spd(), p, probes))(x)     # (nparams, modes, Nx, Ny)
+        Pk = jax.vmap(lambda p: getPropagationTerm(spd(), p))(x)            # (nparams, Nx, Ny)
         phi = prop(phi0, Pk, t_r)
         if probe_type == "TEM":
-            aberration = lambda phi, p: jnp.fft.ifft2(jnp.fft.fft2(phi) * getAberrationFunction(spd, p) * spd["mask"])
+            def aberration(phi, p):
+                d = spd()
+                return jnp.fft.ifft2(jnp.fft.fft2(phi) * getAberrationFunction(d, p) * d["mask"])
             phi = jax.vmap(aberration)(phi, x)
         phi = jnp.sum(phi, axis=1)    # sum over modes, (nparams, Nx, Ny)
         res = jax.vmap(post)(phi, data) if post_with_data else jax.vmap(post)(phi)

@@ -137,3 +137,38 @@ class FunctionSpace:
             dict: A dictionary containing the attributes of the FunctionSpace instance.
         """
         return {"kvec": self.kvec, "mask": self.mask, "dz": self.dz, "k": self.k}
+
+    def asdict_compact(self):
+        """
+        Return a small dictionary from which the dictionary of asdict is calculated by expand_compact (e.g. inside jit),
+        so that the (Nx, Ny) arrays do not have to be kept in memory.
+        """
+        inverse_matrix = 2 * jnp.pi * jnp.linalg.inv(self._unit)
+        # k^2 along the row and the column used in _getMax, calculated without the (Nx, Ny) arrays.
+        x, y = self._shifted_axes()
+        row = jnp.stack([jnp.full_like(y, x[self._N[0] // 2]), y], axis=-1)
+        col = jnp.stack([x, jnp.full_like(x, y[self._N[1] // 2])], axis=-1)
+        k2 = [_safe_norm(jnp.dot(v, inverse_matrix.T))**2 for v in (row, col)]
+        max = jnp.sqrt(jnp.minimum(jnp.min(k2[0]), jnp.min(k2[1])))
+        return {"inv": inverse_matrix, "kmask": max * 2 / 3, "dz": self.dz}
+
+    @staticmethod
+    def expand_compact(c, N):
+        """
+        Return the dictionary of asdict from the dictionary of asdict_compact. N is (Nx, Ny).
+        """
+        x = jnp.roll(jnp.arange(-N[0] // 2, N[0] // 2), N[0] // 2)
+        y = jnp.roll(jnp.arange(-N[1] // 2, N[1] // 2), N[1] // 2)
+        grid = jnp.array(jnp.meshgrid(x, y, indexing="ij")).transpose(1, 2, 0)
+        kvec = jnp.dot(grid, c["inv"].T)
+        k = _safe_norm(kvec, axis=2)
+        return {"kvec": kvec, "mask": jnp.where(k > c["kmask"], 0, 1), "dz": c["dz"], "k": k}
+
+    def _shifted_axes(self):
+        x = jnp.roll(jnp.arange(-self._N[0] // 2, self._N[0] // 2), self._N[0] // 2)
+        y = jnp.roll(jnp.arange(-self._N[1] // 2, self._N[1] // 2), self._N[1] // 2)
+        return x, y
+
+
+def _safe_norm(x, axis=-1, eps=1e-12):
+    return jnp.sqrt(jnp.sum(x * x, axis=axis) + eps)
