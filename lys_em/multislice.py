@@ -162,8 +162,11 @@ def _build_calc(probe_type, postprocess, sum, use_data, chunk, batch, nslices, m
     Return the jitted function calc(params, t_r, spd, probes) for a group of parameters.
     It is cached so that it is compiled only once for the same options and shapes.
     """
-    # sharded: number of slices if they are distributed over the devices (Slices mode "sharded")
-    prop = make_propagator(chunk=chunk, batch=batch, nslices=nslices) if sharded is None else make_sharded_propagator(sharded, mesh, batch)
+    # sharded: number of slices if they are distributed over the devices (Slices mode "sharded"). Pk is calculated when it is used.
+    if sharded is None:
+        prop = make_propagator(chunk=chunk, batch=batch, nslices=nslices, pk_fn=getPropagationTerm)
+    else:
+        prop = make_sharded_propagator(sharded, mesh, batch, pk_fn=getPropagationTerm)
     post = _init_postprocess(postprocess)
     post_with_data = use_data and len(inspect.signature(post).parameters) == 2
     axis = mesh.axis_names[0]
@@ -173,8 +176,7 @@ def _build_calc(probe_type, postprocess, sum, use_data, chunk, batch, nslices, m
         mask, data = x.pop("mask"), x.pop("data", None)
         spd = lambda: FunctionSpace.expand_compact(spc, N)     # kvec, mask and k, calculated where they are used
         phi0 = jax.vmap(lambda p: getWaveFunction(spd(), p, probes))(x)     # (nparams, modes, Nx, Ny)
-        Pk = jax.vmap(lambda p: getPropagationTerm(spd(), p))(x)            # (nparams, Nx, Ny)
-        phi = prop(phi0, Pk, t_r)
+        phi = prop(phi0, x, t_r, spd())     # Pk = getPropagationTerm(spd, x[i]) is calculated in prop
         if probe_type == "TEM":
             def aberration(phi, p):
                 d = spd()
