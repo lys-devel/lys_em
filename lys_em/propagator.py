@@ -40,6 +40,11 @@ def _propagate_all(phi, t, Pk, batch, nvalid=None):
     return jax.lax.map(f, (phi, Pk), batch_size=batch)
 
 
+def _to_trans(phase, mask):
+    """Transmission functions (n, Nx, Ny) from the phase, as PotentialInterface.getTransmissionFunction."""
+    return jnp.fft.ifft2(jnp.fft.fft2(jnp.exp(1j * phase)) * mask)
+
+
 def _scan_chunks(f, carry, t_r, size, xs=None, reverse=False):
     """
     jax.lax.scan of f over chunks of slices: carry, y = f(carry, t, x, start), where t is the next `size` slices
@@ -59,7 +64,7 @@ def _forward(phi0, Pk, t_r, size, batch, nslices, save=False):
     return _scan_chunks(over_chunk, phi0, t_r, size)
 
 
-def make_propagator(chunk=None, batch=1, nslices=None):
+def make_propagator(chunk=None, batch=1, nslices=None, phase=False):
     """
     Return prop(phi0, Pk, t_r) -> phi, which propagates the incident waves through all slices.
 
@@ -67,6 +72,8 @@ def make_propagator(chunk=None, batch=1, nslices=None):
         chunk (int): Number of slices transferred to device at once. Default (None) is all slices.
         batch (int): Number of parameters computed at once.
         nslices (int): Number of slices. If given, t_r may be padded at the end to a multiple of chunk.
+        phase (bool): If True, t_r on host is the phase (float32), and the transmission functions are calculated
+            on device chunk by chunk with the mask given to prop. The gradient is calculated for the phase.
 
     prop arguments (per device):
         phi0: (nparams, nprobe, Nx, Ny), Pk: (nparams, Nx, Ny), t_r: (Nz, Nx, Ny) on device or on (pinned) host.
@@ -77,16 +84,24 @@ def make_propagator(chunk=None, batch=1, nslices=None):
     """
     size = lambda t_r: len(t_r) if chunk is None else min(chunk, len(t_r))
 
-    @jax.custom_vjp
-    def prop(phi0, Pk, t_r):
-        return _forward(phi0, Pk, t_r, size(t_r), batch, nslices)[0]
+    trans = (lambda x, mask: _to_trans(x, mask)) if phase else (lambda x, mask: x)
 
-    def prop_fwd(phi0, Pk, t_r):
-        phi, ck = _forward(phi0, Pk, t_r, size(t_r), batch, nslices, save=True)   # ck: phi at the beginning of each chunk (on host)
-        return phi, (ck, Pk, t_r)
+    def forward(phi0, Pk, t_r, mask, save=False):
+        def over_chunk(phi, x, _, start):
+            new = _propagate_all(phi, trans(x, mask), Pk, batch, None if nslices is None else nslices - start)
+            return new, (jax.device_put(phi, Host) if save else None)
+        return _scan_chunks(over_chunk, phi0, t_r, size(t_r))
+
+    @jax.custom_vjp
+    def prop(phi0, Pk, t_r, mask):
+        return forward(phi0, Pk, t_r, mask)[0]
+
+    def prop_fwd(phi0, Pk, t_r, mask):
+        phi, ck = forward(phi0, Pk, t_r, mask, save=True)   # ck: phi at the beginning of each chunk (on host)
+        return phi, (ck, Pk, t_r, mask)
 
     def prop_bwd(res, g):
-        ck, Pk, t_r = res
+        ck, Pk, t_r, mask = res
         def over_chunk(carry, t, phi, start):
             dphi, dPk = carry
             # t is replicated over devices. Make it device-varying here, so that dt is summed over devices
@@ -94,16 +109,16 @@ def make_propagator(chunk=None, batch=1, nslices=None):
             axes = tuple(jax.typeof(dphi).vma - jax.typeof(t).vma)
             t = _pvary(t, axes)
             nvalid = None if nslices is None else nslices - start
-            _, vjp = jax.vjp(lambda phi, t, pk: _propagate_all(phi, t, pk, batch, nvalid), jax.device_put(phi, Dev), t, Pk)
+            _, vjp = jax.vjp(lambda phi, x, pk: _propagate_all(phi, trans(x, mask), pk, batch, nvalid), jax.device_put(phi, Dev), t, Pk)
             dphi, dt, dpk = vjp(dphi)   # dt is summed over parameters
             return (dphi, dPk + dpk), jax.device_put(jax.lax.psum(dt, axes), Host)
         (dphi0, dPk), dt = _scan_chunks(over_chunk, (g, jnp.zeros_like(Pk)), t_r, size(t_r), xs=ck, reverse=True)
-        return dphi0, dPk, dt.reshape(t_r.shape)
+        return dphi0, dPk, dt.reshape(t_r.shape), None
 
     prop.defvjp(prop_fwd, prop_bwd)
 
-    def propagate(phi0, Pk, t_r):
+    def propagate(phi0, Pk, t_r, mask=None):
         if jax.typeof(t_r).memory_space == Host:
-            return prop(phi0, Pk, t_r)
+            return prop(phi0, Pk, t_r, mask)
         return _forward(phi0, Pk, t_r, size(t_r), batch, nslices)[0]
     return propagate

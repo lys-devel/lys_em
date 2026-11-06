@@ -19,7 +19,9 @@ class Slices:
         mode (str): "device", "pinned" or "auto".
             "device": All slices are placed (replicated) on each device. Device memory ~ Nz.
             "pinned": Slices are placed in pinned host memory and copied to device chunk by chunk.
-                Device memory does not depend on Nz.
+                Device memory does not depend on Nz. If the transmission function is calculated from the phase
+                (the default of potentials), the phase (float32) is placed instead, and the transmission function
+                is calculated on device chunk by chunk, so that host memory for the slices is halved.
             "auto": "pinned" if chunk is given and running on GPU, otherwise "device".
         chunk (int): Number of slices copied to device at once.
             If Nz is not a multiple of chunk, the slices are padded at the end (see nslices).
@@ -31,11 +33,15 @@ class Slices:
     def __init__(self, pot, tem, mode="auto", chunk=None, mesh=None):
         if mode == "auto":
             mode = "pinned" if chunk is not None and jax.default_backend() == "gpu" else "device"
+        self.phase = False
         if mode == "pinned":
             with jax.default_device(jax.devices("cpu")[0]):
-                self._t_r = pot.getTransmissionFunction(tem)
+                self.phase = _uses_phase(pot)
+                self._t_r = pot.getPhase(tem) if self.phase else pot.getTransmissionFunction(tem)
             if chunk is None or chunk >= len(self._t_r):   # XLA fails for a single chunk with host offloading
                 mode = "device"
+                if self.phase:
+                    self.phase, self._t_r = False, pot.getTransmissionFunction(tem)
         else:
             self._t_r = pot.getTransmissionFunction(tem)
         self.nslices = None
@@ -43,7 +49,7 @@ class Slices:
         if chunk is not None and chunk < nz and nz % chunk:
             self.nslices = nz
             with jax.default_device(jax.devices("cpu")[0] if mode == "pinned" else None):
-                self._t_r = jnp.pad(self._t_r, ((0, chunk - nz % chunk), (0, 0), (0, 0)), constant_values=1)
+                self._t_r = jnp.pad(self._t_r, ((0, chunk - nz % chunk), (0, 0), (0, 0)), constant_values=0 if self.phase else 1)
         self.mode = mode
         mesh = jax.sharding.Mesh(jax.devices(), ('i',)) if mesh is None else mesh
         self._sharding = jax.sharding.NamedSharding(mesh, P(), memory_kind="pinned_host" if mode == "pinned" else "device")
@@ -67,6 +73,16 @@ class Slices:
             return placed
         attach.defvjp(lambda x, placed: (placed, None), lambda _, g: (jax.device_put(g, cpu), None))  # Device object keeps <host> type
         return attach(self._t_r, self._placed)
+
+
+def _uses_phase(pot):
+    """True if the transmission function of pot is calculated from its phase (PotentialInterface.getTransmissionFunction)."""
+    from .potentials.interface import PotentialInterface
+    from .potentials.generalPotential import GeneralPotential
+    if isinstance(pot, GeneralPotential) and pot._transFunc is not None:
+        return False
+    method = type(pot).getTransmissionFunction
+    return method is PotentialInterface.getTransmissionFunction or method is GeneralPotential.getTransmissionFunction
 
 
 def multislice(pot, tem, probe="TEM", postprocess=None, sum=False, data=None, use_checkpoint=False, mesh=None, slices="auto", chunk="auto", batch="auto", group="auto"):
@@ -105,7 +121,7 @@ def multislice(pot, tem, probe="TEM", postprocess=None, sum=False, data=None, us
     t_r = Slices(pot, tem, slices, chunk, mesh)
     probe_type = probe if isinstance(probe, str) else None
     probes = probe if probe_type is None else jnp.array([jnp.fft.ifft2(jnp.ones(sp.N[:2]))])
-    calc = _build_calc(probe_type, postprocess, sum, data is not None, chunk, batch, t_r.nslices, mesh)
+    calc = _build_calc(probe_type, postprocess, sum, data is not None, chunk, batch, t_r.nslices, mesh, t_r.phase)
 
     # Pad the parameters so that each device has the same number of groups of the same size.
     nparams = len(tem.params)
@@ -144,12 +160,12 @@ def _auto_options(sp, chunk, batch, group):
 
 
 @functools.lru_cache
-def _build_calc(probe_type, postprocess, sum, use_data, chunk, batch, nslices, mesh):
+def _build_calc(probe_type, postprocess, sum, use_data, chunk, batch, nslices, mesh, phase=False):
     """
     Return the jitted function calc(params, t_r, spd, probes) for a group of parameters.
     It is cached so that it is compiled only once for the same options and shapes.
     """
-    prop = make_propagator(chunk=chunk, batch=batch, nslices=nslices)
+    prop = make_propagator(chunk=chunk, batch=batch, nslices=nslices, phase=phase)   # phase: t_r is the phase (pinned)
     post = _init_postprocess(postprocess)
     post_with_data = use_data and len(inspect.signature(post).parameters) == 2
     axis = mesh.axis_names[0]
@@ -159,7 +175,7 @@ def _build_calc(probe_type, postprocess, sum, use_data, chunk, batch, nslices, m
         mask, data = x.pop("mask"), x.pop("data", None)
         phi0 = jax.vmap(lambda p: getWaveFunction(spd, p, probes))(x)     # (nparams, modes, Nx, Ny)
         Pk = jax.vmap(lambda p: getPropagationTerm(spd, p))(x)            # (nparams, Nx, Ny)
-        phi = prop(phi0, Pk, t_r)
+        phi = prop(phi0, Pk, t_r, spd["mask"])
         if probe_type == "TEM":
             aberration = lambda phi, p: jnp.fft.ifft2(jnp.fft.fft2(phi) * getAberrationFunction(spd, p) * spd["mask"])
             phi = jax.vmap(aberration)(phi, x)
